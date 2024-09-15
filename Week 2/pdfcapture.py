@@ -184,98 +184,115 @@ def pre_process_image(image):
     Pre-process the image to enhance OCR detection by improving contrast, reducing noise, and performing edge detection.
     """
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+    # Apply a Gaussian blur to reduce noise
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Use edge detection to highlight contours (important for formula and text clarity)
     edges = cv2.Canny(blurred, 100, 200)
+    # Return the processed image to be used in OCR
     return edges
 
-def check_and_adjust_content(cropped_image, page_height_px, current_page_height, pdf):
+def check_and_adjust_content(cropped_image, page_height_px):
     """
-    Detect if any text blocks, formulas, or graphs are close to the bottom of the page and adjust them to prevent splitting.
+    Detect if any text blocks, formulas, or graphs are split between pages and adjust them to prevent splitting.
     Uses OCR for text, formulas, and image processing for graphs to ensure no content is split between pages.
     """
     try:
+        # Pre-process the image before running OCR
         processed_image = pre_process_image(cropped_image)
+
+        # Run OCR on the processed image to detect text and their positions
         ocr_data = pytesseract.image_to_data(processed_image, output_type=pytesseract.Output.DICT)
 
+        # Variables to detect block regions for text/formulas
         block_top = None
         block_bottom = None
         block_texts = []
         formula_detected = False
         previous_bottom = 0
 
-        # Thresholds for detecting page bottom proximity
-        formula_margin = 120
-        text_margin = 100
-
+        # Minimum vertical gap between lines to treat them as part of the same block
         line_spacing_threshold = 15
+
+        # Symbols that might be part of a formula
         formula_keywords = ['∫', '=', '∑', 'π', 'dx', 'dy', 'dz', 'sin', 'cos', 'tan', 'log', 'ln', 'exp', '^', '/', '√']
 
+        # Iterate through all detected text lines
         for i in range(len(ocr_data['text'])):
             current_text = ocr_data['text'][i].strip()
 
-            if current_text:
+            if current_text:  # Ignore empty lines
                 top = ocr_data['top'][i]
                 height = ocr_data['height'][i]
                 bottom = top + height
 
+                # Check if this line contains a formula-like expression
                 if any(keyword in current_text for keyword in formula_keywords):
-                    formula_detected = True
+                    formula_detected = True  # Treat this as part of a formula block
 
+                # If the gap between the current line and the previous line is small, treat them as part of the same block
                 if block_top is None or (top - previous_bottom) < line_spacing_threshold:
                     if block_top is None:
                         block_top = top
                     block_bottom = bottom
                     block_texts.append(current_text)
                 else:
-                    # Check for page break before rendering the block
-                    margin = formula_margin if formula_detected else text_margin
-                    if current_page_height + (block_bottom - block_top) > page_height_px - margin:
-                        print(f"Manual page break triggered for block: {block_texts}")
-                        pdf.add_page()  # Add new page
-                        current_page_height = 0  # Reset page height
-
-                    current_page_height += (block_bottom - block_top)
+                    # We've encountered a new block, so we check if the previous block is near the page break
+                    # Use larger margin for formulas to ensure no splitting
+                    margin = 120 if formula_detected else 100
+                    if block_bottom > page_height_px - margin:
+                        print(f"Detected block spanning the page break: {block_texts}. Moving entire block.")
+                        return True  # Move entire block to the next page
+                    
+                    # Reset for the new block
                     block_top = top
                     block_bottom = bottom
                     block_texts = [current_text]
-                    formula_detected = False
+                    formula_detected = False  # Reset formula detection
 
                 previous_bottom = bottom
 
-        # Also handle visual elements like graphs similarly
+        # Now handle non-text content like graphs using basic image processing
         gray_image = cv2.cvtColor(np.array(cropped_image), cv2.COLOR_RGB2GRAY)
+
+        # Detect non-white areas (where visual content like graphs exist)
         _, binary_image = cv2.threshold(gray_image, 240, 255, cv2.THRESH_BINARY_INV)
 
+        # Find contours of the non-white regions
         contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # Check if any large contour (like a graph) is near the bottom of the page
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
+
+            # If the graph's height is greater than the remaining space on the page, move it
             remaining_space = page_height_px - y
 
+            # Adjust for graphs varying in size
             if h > remaining_space:
-                print(f"Manual page break triggered for large visual element.")
-                pdf.add_page()  # Add new page
-                current_page_height = 0  # Reset page height
+                print(f"Detected large graph (height: {h}px) that spans the page break. Moving to the next page.")
+                return True  # Move the graph to the next page
+            else:
+                print(f"Graph detected (height: {h}px) fits within the remaining space of {remaining_space}px.")
 
-        return current_page_height
+        return False  # No split detected
     except Exception as e:
         print(f"Error during content detection: {e}")
-        return current_page_height
+        return False
 
 def save_stitched_image_as_pdf(stitched_image_path, output_pdf="partitioned_output.pdf", page_height_mm=297, dpi=96):
-    """Save the stitched image as a multi-page PDF, partitioning it based on page height."""
+    """Save the stitched image as a multi-page PDF, partitioning it based on page height and adding white space on the last page."""
     try:
         img = Image.open(stitched_image_path)
         width_px, height_px = img.size
 
+        # Convert pixel size to millimeters based on dpi
         width_mm = (width_px / dpi) * 25.4
         page_height_px = int((page_height_mm / 25.4) * dpi)
 
         num_pages = math.ceil(height_px / page_height_px)
         pdf = FPDF(unit="mm", format=[width_mm, page_height_mm])
 
-        current_page_height = 0
-
-        for page in range(num_pages):
+        for page in range(num_pages - 1):  # Process all pages except the last one
             upper = page * page_height_px
             lower = min((page + 1) * page_height_px, height_px)
             box = (0, upper, width_px, lower)
@@ -283,7 +300,11 @@ def save_stitched_image_as_pdf(stitched_image_path, output_pdf="partitioned_outp
             cropped_img = img.crop(box)
 
             # Check and adjust content before rendering the block to the PDF
-            current_page_height = check_and_adjust_content(cropped_img, page_height_px, current_page_height, pdf)
+            adjust_content = check_and_adjust_content(cropped_img, page_height_px)
+            
+            if adjust_content:
+                print(f"Adjusting page content at page {page}.")
+                # You can skip this page or handle the logic to move content to the next one
 
             temp_img_path = f"temp_page_{page}.png"
             cropped_img.save(temp_img_path)
@@ -291,6 +312,42 @@ def save_stitched_image_as_pdf(stitched_image_path, output_pdf="partitioned_outp
             pdf.add_page()
             pdf.image(temp_img_path, 0, 0, width_mm, page_height_mm)
 
+        # Handle the last page separately with white space if needed
+        last_page_height = height_px % page_height_px
+        if last_page_height > 0:
+            # Add white space to fill the remaining area
+            white_space_height_px = page_height_px - last_page_height
+            white_space = Image.new('RGB', (width_px, white_space_height_px), (255, 255, 255))  # Create a white image
+
+            # Crop the last part of the image
+            upper = (num_pages - 1) * page_height_px
+            cropped_img = img.crop((0, upper, width_px, height_px))
+
+            # Combine the last image with the white space
+            final_img = Image.new('RGB', (width_px, page_height_px), (255, 255, 255))
+            final_img.paste(cropped_img, (0, 0))  # Paste the cropped content at the top
+            final_img.paste(white_space, (0, last_page_height))  # Add the white space below
+
+            # Save the new image with white space as the final page
+            temp_img_path = f"temp_page_{num_pages}.png"
+            final_img.save(temp_img_path)
+
+            pdf.add_page()
+            pdf.image(temp_img_path, 0, 0, width_mm, page_height_mm)
+        else:
+            # If the last page doesn't need white space, just add it normally
+            upper = (num_pages - 1) * page_height_px
+            lower = height_px
+            box = (0, upper, width_px, lower)
+
+            cropped_img = img.crop(box)
+            temp_img_path = f"temp_page_{num_pages}.png"
+            cropped_img.save(temp_img_path)
+
+            pdf.add_page()
+            pdf.image(temp_img_path, 0, 0, width_mm, page_height_mm)
+
+        # Output the final PDF
         pdf_output_path = output_pdf
         pdf.output(pdf_output_path)
         print(f"PDF saved as '{pdf_output_path}'.")
